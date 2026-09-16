@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+
+import curses
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from dataclasses import dataclass, field
+
+
+# ============================================================
+# NEXUS
+# TERMINAL APP CONTROL CENTER
+# ============================================================
+
+APP_NAME = "NEXUS"
+VERSION = "2.0.0"
+
+HOME = Path.home()
+
+APP_DIRS = [
+    HOME / ".local/share/applications",
+    Path("/usr/local/share/applications"),
+    Path("/usr/share/applications"),
+]
+
+# Colors
+CYAN = 1
+BLUE = 2
+SELECTED = 3
+WHITE = 4
+GREEN = 5
+RED = 6
+YELLOW = 7
+GRAY = 8
+
+
+# ============================================================
+# APPLICATION OBJECT
+# ============================================================
+
+@dataclass
+class Application:
+
+    name: str = "Unknown"
+    desktop_file: str = ""
+    command: str = ""
+    icon: str = ""
+    comment: str = ""
+    generic_name: str = ""
+    categories: list = field(default_factory=list)
+
+    terminal: bool = False
+    hidden: bool = False
+    nodisplay: bool = False
+
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def category(self):
+
+        if self.categories:
+            return self.categories[0]
+
+        return "Other"
+
+
+# ============================================================
+# DESKTOP FILE PARSER
+# ============================================================
+
+class DesktopFile:
+
+    @staticmethod
+    def parse(path):
+
+        try:
+
+            text = path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+
+        except Exception:
+
+            return None
+
+        data = {}
+        desktop_entry = False
+
+        for raw in text.splitlines():
+
+            line = raw.strip()
+
+            if not line:
+                continue
+
+            if line.startswith("#"):
+                continue
+
+            if line == "[Desktop Entry]":
+
+                desktop_entry = True
+                continue
+
+            if line.startswith("["):
+
+                desktop_entry = False
+                continue
+
+            if not desktop_entry:
+                continue
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split(
+                "=",
+                1
+            )
+
+            data[key.strip()] = value.strip()
+
+        if data.get("Type", "Application") != "Application":
+
+            return None
+
+        name = data.get(
+            "Name",
+            path.stem
+        )
+
+        hidden = data.get(
+            "Hidden",
+            "false"
+        ).lower() == "true"
+
+        nodisplay = data.get(
+            "NoDisplay",
+            "false"
+        ).lower() == "true"
+
+        terminal = data.get(
+            "Terminal",
+            "false"
+        ).lower() == "true"
+
+        categories = [
+            item
+            for item in data.get(
+                "Categories",
+                ""
+            ).split(";")
+            if item
+        ]
+
+        return Application(
+            name=name,
+            desktop_file=str(path),
+            command=data.get(
+                "Exec",
+                ""
+            ),
+            icon=data.get(
+                "Icon",
+                ""
+            ),
+            comment=data.get(
+                "Comment",
+                ""
+            ),
+            generic_name=data.get(
+                "GenericName",
+                ""
+            ),
+            categories=categories,
+            terminal=terminal,
+            hidden=hidden,
+            nodisplay=nodisplay,
+            raw=data
+        )
+
+
+# ============================================================
+# APPLICATION SCANNER
+# ============================================================
+
+class AppScanner:
+
+    def __init__(self):
+
+        self.apps = []
+
+    def scan(self, progress=None):
+
+        applications = {}
+
+        files = []
+
+        for directory in APP_DIRS:
+
+            if not directory.exists():
+                continue
+
+            try:
+
+                for file in directory.glob(
+                    "*.desktop"
+                ):
+
+                    if file.is_file():
+                        files.append(file)
+
+            except Exception:
+                pass
+
+        total = len(files)
+
+        for index, file in enumerate(
+            files,
+            start=1
+        ):
+
+            if progress:
+
+                progress(
+                    index,
+                    total,
+                    file.name
+                )
+
+            app = DesktopFile.parse(file)
+
+            if app is None:
+                continue
+
+            if app.hidden:
+                continue
+
+            # Prefer user entries when duplicate
+            # desktop filenames exist.
+            filename = file.name
+
+            if filename in applications:
+
+                existing = applications[
+                    filename
+                ]
+
+                if (
+                    str(file).startswith(
+                        str(HOME)
+                    )
+                ):
+
+                    applications[
+                        filename
+                    ] = app
+
+            else:
+
+                applications[
+                    filename
+                ] = app
+
+        self.apps = sorted(
+            applications.values(),
+            key=lambda app:
+                app.name.lower()
+        )
+
+        return self.apps
+
+
+# ============================================================
+# EXEC FIELD CODE CLEANER
+# ============================================================
+
+class ExecParser:
+
+    FIELD_CODES = {
+        "%f",
+        "%F",
+        "%u",
+        "%U",
+        "%i",
+        "%c",
+        "%k",
+        "%v",
+        "%m",
+    }
+
+    @staticmethod
+    def build(command):
+
+        if not command:
+            return None
+
+        try:
+
+            args = shlex.split(
+                command
+            )
+
+        except ValueError:
+
+            return None
+
+        cleaned = []
+
+        for arg in args:
+
+            # Desktop field codes are not literal
+            # command arguments when no file/URL
+            # is being supplied.
+            if arg in ExecParser.FIELD_CODES:
+
+                if arg == "%c":
+                    continue
+
+                if arg == "%k":
+                    continue
+
+                if arg == "%i":
+                    continue
+
+                if arg == "%m":
+                    continue
+
+                if arg == "%v":
+                    continue
+
+                if arg in (
+                    "%f",
+                    "%F",
+                    "%u",
+                    "%U",
+                ):
+                    continue
+
+            # Remove field codes embedded in arguments.
+            for code in ExecParser.FIELD_CODES:
+
+                arg = arg.replace(
+                    code,
+                    ""
+                )
+
+            if arg:
+                cleaned.append(arg)
+
+        if not cleaned:
+            return None
+
+        return cleaned
+
+
+# ============================================================
+# TERMINAL UI
+# ============================================================
+
+class Nexus:
+
+    def __init__(self, screen):
+
+        self.screen = screen
+
+        self.scanner = AppScanner()
+
+        self.apps = []
+
+        self.filtered = []
+
+        self.selected = 0
+
+        self.scroll = 0
+
+        self.search = ""
+
+        self.status = "Starting NEXUS..."
+
+        self.running = True
+
+        self.init_colors()
+
+    # --------------------------------------------------------
+    # COLORS
+    # --------------------------------------------------------
+
+    def init_colors(self):
+
+        curses.start_color()
+
+        curses.use_default_colors()
+
+        curses.init_pair(
+            CYAN,
+            curses.COLOR_CYAN,
+            -1
+        )
+
+        curses.init_pair(
+            BLUE,
+            curses.COLOR_WHITE,
+            curses.COLOR_BLUE
+        )
+
+        curses.init_pair(
+            SELECTED,
+            curses.COLOR_BLACK,
+            curses.COLOR_CYAN
+        )
+
+        curses.init_pair(
+            WHITE,
+            curses.COLOR_WHITE,
+            -1
+        )
+
+        curses.init_pair(
+            GREEN,
+            curses.COLOR_GREEN,
+            -1
+        )
+
+        curses.init_pair(
+            RED,
+            curses.COLOR_RED,
+            -1
+        )
+
+        curses.init_pair(
+            YELLOW,
+            curses.COLOR_YELLOW,
+            -1
+        )
+
+        curses.init_pair(
+            GRAY,
+            curses.COLOR_WHITE,
+            -1
+        )
+
+    # --------------------------------------------------------
+    # SAFE TEXT
+    # --------------------------------------------------------
+
+    def text(
+        self,
+        y,
+        x,
+        value,
+        attr=0
+    ):
+
+        try:
+
+            height, width = (
+                self.screen.getmaxyx()
+            )
+
+            if y < 0 or y >= height:
+                return
+
+            if x < 0 or x >= width:
+                return
+
+            value = str(value)
+
+            value = value[
+                :max(
+                    0,
+                    width - x - 1
+                )
+            ]
+
+            self.screen.addstr(
+                y,
+                x,
+                value,
+                attr
+            )
+
+        except curses.error:
+            pass
+
+    # --------------------------------------------------------
+    # CENTER
+    # --------------------------------------------------------
+
+    def center(
+        self,
+        y,
+        value,
+        attr=0
+    ):
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        x = max(
+            0,
+            (width - len(value)) // 2
+        )
+
+        self.text(
+            y,
+            x,
+            value,
+            attr
+        )
+
+    # --------------------------------------------------------
+    # BOOT
+    # --------------------------------------------------------
+
+    def boot(self):
+
+        frames = [
+            "N",
+            "NE",
+            "NEX",
+            "NEXU",
+            "NEXUS"
+        ]
+
+        for frame in frames:
+
+            self.screen.erase()
+
+            height, width = (
+                self.screen.getmaxyx()
+            )
+
+            self.center(
+                height // 2 - 2,
+                frame,
+                curses.color_pair(
+                    BLUE
+                ) | curses.A_BOLD
+            )
+
+            self.center(
+                height // 2,
+                "TERMINAL APP CONTROL CENTER",
+                curses.color_pair(
+                    CYAN
+                )
+            )
+
+            self.screen.refresh()
+
+            time.sleep(0.10)
+
+    # --------------------------------------------------------
+    # SCAN
+    # --------------------------------------------------------
+
+    def scan(self):
+
+        self.screen.nodelay(True)
+
+        state = {
+            "current": 0,
+            "total": 1,
+            "file": ""
+        }
+
+        def progress(
+            current,
+            total,
+            filename
+        ):
+
+            state["current"] = current
+            state["total"] = max(
+                1,
+                total
+            )
+            state["file"] = filename
+
+            self.draw_scanner(
+                state
+            )
+
+        self.apps = self.scanner.scan(
+            progress
+        )
+
+        self.filtered = list(
+            self.apps
+        )
+
+        self.selected = 0
+
+        self.scroll = 0
+
+        self.status = (
+            f"{len(self.apps)} applications discovered."
+        )
+
+        self.draw_scanner(
+            {
+                "current": state["total"],
+                "total": state["total"],
+                "file": "SCAN COMPLETE"
+            }
+        )
+
+        time.sleep(0.4)
+
+        self.screen.nodelay(False)
+
+    # --------------------------------------------------------
+    # SCANNER SCREEN
+    # --------------------------------------------------------
+
+    def draw_scanner(
+        self,
+        state
+    ):
+
+        self.screen.erase()
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        self.center(
+            max(1, height // 2 - 4),
+            "NEXUS",
+            curses.color_pair(
+                BLUE
+            ) | curses.A_BOLD
+        )
+
+        self.center(
+            max(1, height // 2 - 2),
+            "SCANNING APPLICATIONS",
+            curses.color_pair(
+                YELLOW
+            )
+        )
+
+        total = max(
+            1,
+            state["total"]
+        )
+
+        current = min(
+            state["current"],
+            total
+        )
+
+        percent = int(
+            current * 100 / total
+        )
+
+        bar_width = min(
+            50,
+            max(
+                10,
+                width - 20
+            )
+        )
+
+        filled = int(
+            bar_width * percent / 100
+        )
+
+        bar = (
+            "█" * filled
+            + "░" * (
+                bar_width - filled
+            )
+        )
+
+        self.center(
+            height // 2,
+            f"[{bar}] {percent}%",
+            curses.color_pair(
+                GREEN
+            )
+        )
+
+        self.center(
+            height // 2 + 2,
+            state["file"],
+            curses.color_pair(
+                WHITE
+            )
+        )
+
+        self.screen.refresh()
+
+    # --------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------
+
+    def header(self):
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        title = (
+            " NEXUS v2.0 "
+            " | TERMINAL APP CONTROL CENTER "
+        )
+
+        self.text(
+            0,
+            0,
+            title.ljust(
+                max(1, width - 1)
+            ),
+            curses.color_pair(
+                BLUE
+            ) | curses.A_BOLD
+        )
+
+        self.text(
+            1,
+            0,
+            "─" * max(
+                1,
+                width - 1
+            ),
+            curses.color_pair(
+                CYAN
+            )
+        )
+
+    # --------------------------------------------------------
+    # FOOTER
+    # --------------------------------------------------------
+
+    def footer(self):
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        self.text(
+            height - 2,
+            0,
+            "─" * max(
+                1,
+                width - 1
+            ),
+            curses.color_pair(
+                CYAN
+            )
+        )
+
+        controls = (
+            " ENTER Launch "
+            " I Info "
+            " / Search "
+            " R Rescan "
+            " Q Quit "
+        )
+
+        self.text(
+            height - 1,
+            0,
+            controls.ljust(
+                max(1, width - 1)
+            ),
+            curses.color_pair(
+                BLUE
+            )
+        )
+
+    # --------------------------------------------------------
+    # MAIN LIST
+    # --------------------------------------------------------
+
+    def draw(self):
+
+        self.screen.erase()
+
+        self.header()
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        heading = (
+            f"APPLICATIONS "
+            f"({len(self.filtered)})"
+        )
+
+        if self.search:
+
+            heading += (
+                f"  | SEARCH: {self.search}"
+            )
+
+        self.text(
+            3,
+            2,
+            heading,
+            curses.color_pair(
+                YELLOW
+            ) | curses.A_BOLD
+        )
+
+        top = 5
+
+        bottom = height - 3
+
+        visible = max(
+            1,
+            bottom - top
+        )
+
+        if self.selected < self.scroll:
+
+            self.scroll = self.selected
+
+        if self.selected >= (
+            self.scroll + visible
+        ):
+
+            self.scroll = (
+                self.selected
+                - visible
+                + 1
+            )
+
+        end = min(
+            len(self.filtered),
+            self.scroll + visible
+        )
+
+        for position, index in enumerate(
+            range(
+                self.scroll,
+                end
+            )
+        ):
+
+            app = self.filtered[
+                index
+            ]
+
+            y = top + position
+
+            number = (
+                f"{index + 1:03d}"
+            )
+
+            category = app.category
+
+            line = (
+                f"{number}  "
+                f"{app.name}"
+            )
+
+            available = (
+                width - 28
+            )
+
+            if len(line) > available:
+
+                line = line[
+                    :max(
+                        1,
+                        available - 3
+                    )
+                ] + "..."
+
+            line = (
+                line.ljust(
+                    max(
+                        1,
+                        width - 24
+                    )
+                )
+                + category[:20]
+            )
+
+            if index == self.selected:
+
+                self.text(
+                    y,
+                    1,
+                    "> " + line,
+                    curses.color_pair(
+                        SELECTED
+                    ) | curses.A_BOLD
+                )
+
+            else:
+
+                self.text(
+                    y,
+                    1,
+                    "  " + line,
+                    curses.color_pair(
+                        WHITE
+                    )
+                )
+
+        if not self.filtered:
+
+            self.center(
+                height // 2,
+                "NO APPLICATIONS FOUND",
+                curses.color_pair(
+                    RED
+                ) | curses.A_BOLD
+            )
+
+        self.text(
+            height - 3,
+            2,
+            self.status,
+            curses.color_pair(
+                GREEN
+            )
+        )
+
+        self.footer()
+
+        self.screen.refresh()
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
+    def search_dialog(self):
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        curses.echo()
+
+        self.text(
+            height - 4,
+            2,
+            "Search: ",
+            curses.color_pair(
+                YELLOW
+            )
+        )
+
+        self.screen.refresh()
+
+        try:
+
+            query = self.screen.getstr(
+                height - 4,
+                10,
+                200
+            ).decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        finally:
+
+            curses.noecho()
+
+        query = query.strip()
+
+        if not query:
+
+            self.search = ""
+
+            self.filtered = list(
+                self.apps
+            )
+
+            self.selected = 0
+
+            self.scroll = 0
+
+            self.status = (
+                "Search cleared."
+            )
+
+            return
+
+        self.search = query
+
+        needle = query.lower()
+
+        self.filtered = [
+
+            app
+
+            for app in self.apps
+
+            if (
+                needle in app.name.lower()
+                or needle in app.comment.lower()
+                or needle in app.generic_name.lower()
+                or needle in app.command.lower()
+                or any(
+                    needle in category.lower()
+                    for category
+                    in app.categories
+                )
+            )
+        ]
+
+        self.selected = 0
+
+        self.scroll = 0
+
+        self.status = (
+            f"{len(self.filtered)} result(s)."
+        )
+
+    # --------------------------------------------------------
+    # LAUNCH APPLICATION
+    # --------------------------------------------------------
+
+    def launch(self, app):
+
+        command = ExecParser.build(
+            app.command
+        )
+
+        if not command:
+
+            self.status = (
+                "Cannot parse application command."
+            )
+
+            return
+
+        executable = command[0]
+
+        if not (
+            os.path.isabs(executable)
+            or shutil.which(executable)
+        ):
+
+            self.status = (
+                f"Executable not found: {executable}"
+            )
+
+            return
+
+        try:
+
+            subprocess.Popen(
+                command,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL
+            )
+
+            self.status = (
+                f"Launched: {app.name}"
+            )
+
+        except Exception as error:
+
+            self.status = (
+                f"Launch failed: {error}"
+            )
+
+    # --------------------------------------------------------
+    # INFO SCREEN
+    # --------------------------------------------------------
+
+    def info(self, app):
+
+        while True:
+
+            self.screen.erase()
+
+            self.header()
+
+            height, width = (
+                self.screen.getmaxyx()
+            )
+
+            self.text(
+                3,
+                2,
+                "APPLICATION INFORMATION",
+                curses.color_pair(
+                    YELLOW
+                ) | curses.A_BOLD
+            )
+
+            fields = [
+                ("Name", app.name),
+                ("Generic Name", app.generic_name),
+                ("Category", app.category),
+                ("Comment", app.comment),
+                ("Command", app.command),
+                ("Icon", app.icon),
+                ("Terminal", app.terminal),
+                ("Desktop File", app.desktop_file),
+            ]
+
+            y = 5
+
+            for label, value in fields:
+
+                self.text(
+                    y,
+                    3,
+                    f"{label}:",
+                    curses.color_pair(
+                        YELLOW
+                    ) | curses.A_BOLD
+                )
+
+                value = value or "-"
+
+                self.text(
+                    y,
+                    22,
+                    value,
+                    curses.color_pair(
+                        WHITE
+                    )
+                )
+
+                y += 2
+
+                if y >= height - 4:
+                    break
+
+            self.text(
+                height - 2,
+                0,
+                "ENTER / ESC = Back".ljust(
+                    max(1, width - 1)
+                ),
+                curses.color_pair(
+                    BLUE
+                )
+            )
+
+            self.screen.refresh()
+
+            key = self.screen.getch()
+
+            if key in (
+                10,
+                13,
+                27
+            ):
+
+                return
+
+    # --------------------------------------------------------
+    # HELP
+    # --------------------------------------------------------
+
+    def help(self):
+
+        while True:
+
+            self.screen.erase()
+
+            self.header()
+
+            height, width = (
+                self.screen.getmaxyx()
+            )
+
+            self.text(
+                3,
+                2,
+                "NEXUS GUIDE",
+                curses.color_pair(
+                    YELLOW
+                ) | curses.A_BOLD
+            )
+
+            lines = [
+
+                "UP / DOWN    Select application",
+
+                "J / K        Select application",
+
+                "ENTER        Launch selected app",
+
+                "I            Application information",
+
+                "/            Search applications",
+
+                "R            Scan applications again",
+
+                "H / ?        Open this guide",
+
+                "ESC          Clear search",
+
+                "Q            Quit NEXUS",
+
+                "",
+
+                "NEXUS reads Linux .desktop files.",
+
+                "Applications are launched as separate",
+
+                "processes, so NEXUS can remain running.",
+
+            ]
+
+            y = 5
+
+            for line in lines:
+
+                self.text(
+                    y,
+                    4,
+                    line
+                )
+
+                y += 1
+
+            self.text(
+                height - 2,
+                0,
+                "ESC / Q = Back".ljust(
+                    max(1, width - 1)
+                ),
+                curses.color_pair(
+                    BLUE
+                )
+            )
+
+            self.screen.refresh()
+
+            key = self.screen.getch()
+
+            if key in (
+                27,
+                ord("q"),
+                ord("Q"),
+                ord("h"),
+                ord("H")
+            ):
+
+                return
+
+    # --------------------------------------------------------
+    # KEYBOARD
+    # --------------------------------------------------------
+
+    def key(self, key):
+
+        if key in (
+            curses.KEY_UP,
+            ord("k"),
+            ord("K")
+        ):
+
+            self.selected = max(
+                0,
+                self.selected - 1
+            )
+
+        elif key in (
+            curses.KEY_DOWN,
+            ord("j"),
+            ord("J")
+        ):
+
+            self.selected = min(
+                max(
+                    0,
+                    len(self.filtered) - 1
+                ),
+                self.selected + 1
+            )
+
+        elif key in (
+            curses.KEY_PPAGE,
+        ):
+
+            self.selected = max(
+                0,
+                self.selected - 10
+            )
+
+        elif key in (
+            curses.KEY_NPAGE,
+        ):
+
+            self.selected = min(
+                max(
+                    0,
+                    len(self.filtered) - 1
+                ),
+                self.selected + 10
+            )
+
+        elif key in (
+            10,
+            13,
+            curses.KEY_ENTER
+        ):
+
+            if self.filtered:
+
+                self.launch(
+                    self.filtered[
+                        self.selected
+                    ]
+                )
+
+        elif key in (
+            ord("i"),
+            ord("I")
+        ):
+
+            if self.filtered:
+
+                self.info(
+                    self.filtered[
+                        self.selected
+                    ]
+                )
+
+        elif key == ord("/"):
+
+            self.search_dialog()
+
+        elif key in (
+            ord("r"),
+            ord("R")
+        ):
+
+            self.scan()
+
+        elif key in (
+            ord("h"),
+            ord("H"),
+            ord("?")
+        ):
+
+            self.help()
+
+        elif key == 27:
+
+            if self.search:
+
+                self.search = ""
+
+                self.filtered = list(
+                    self.apps
+                )
+
+                self.selected = 0
+
+                self.scroll = 0
+
+                self.status = (
+                    "Search cleared."
+                )
+
+            else:
+
+                self.running = False
+
+        elif key in (
+            ord("q"),
+            ord("Q")
+        ):
+
+            self.running = False
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
+    def run(self):
+
+        self.boot()
+
+        self.scan()
+
+        while self.running:
+
+            self.draw()
+
+            key = self.screen.getch()
+
+            self.key(key)
+
+        self.screen.erase()
+
+        height, width = (
+            self.screen.getmaxyx()
+        )
+
+        self.center(
+            height // 2,
+            "NEXUS OFFLINE",
+            curses.color_pair(
+                CYAN
+            ) | curses.A_BOLD
+        )
+
+        self.screen.refresh()
+
+        time.sleep(0.3)
+
+
+# ============================================================
+# CURSES ENTRY
+# ============================================================
+
+def main():
+
+    try:
+
+        curses.wrapper(
+            lambda screen:
+            Nexus(screen).run()
+        )
+
+    except KeyboardInterrupt:
+
+        pass
+
+    except Exception as error:
+
+        print(
+            f"NEXUS ERROR: {error}",
+            file=sys.stderr
+        )
+
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+
+    sys.exit(
+        main()
+    )
